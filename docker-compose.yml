@@ -1,6 +1,8 @@
 services:
   search-server:
-    image: ghcr.io/oro-ai/oro/search-server:${IMAGE_TAG:-stable}
+    # SEARCH_SERVER_IMAGE lets a deployment pin a generated-index image without
+    # changing the shared validator/proxy/sandbox IMAGE_TAG.
+    image: ${SEARCH_SERVER_IMAGE:-ghcr.io/oro-ai/oro/search-server:${IMAGE_TAG:-stable}}
     build:
       context: .
       dockerfile: docker/search-server/Dockerfile
@@ -8,19 +10,40 @@ services:
     environment:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-5632}
-      - WAITRESS_CONNECTION_LIMIT=${WAITRESS_CONNECTION_LIMIT:-1000}
+      # gunicorn sync worker processes (default nproc/2, floor 2). Keep
+      # workers <= free cores so the extra JVMs don't oversubscribe.
+      - SEARCH_WORKERS=${SEARCH_WORKERS:-}
+      # Per-worker JVM heap. Must match the Dockerfile default (this compose var
+      # overrides the image ENV). Index is off-heap/mmap, so 1g/worker is plenty;
+      # keeps total heap modest across N workers on memory-constrained hosts.
+      - _JAVA_OPTIONS=${_JAVA_OPTIONS:--Xmx1g -Xms256m}
+    # Loopback-only publish. The validator runtime reaches search-server over
+    # the `main` docker network (`http://search-server:5632`), so no host publish
+    # is required for normal operation. Keeping a loopback publish lets an
+    # operator `curl 127.0.0.1:5632/health` from an EC2 shell without
+    # exposing the port on any external interface — docker binds to the wildcard
+    # address by default, and Docker's iptables rules bypass UFW.
     ports:
-      - "${PORT:-5632}:${PORT:-5632}"
+      - "127.0.0.1:${PORT:-5632}:${PORT:-5632}"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; import urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT', '5632') + '/health').read()\""]
       interval: 10s
-      timeout: 5s
+      # 10s (was 5s): under a heavy concurrent search burst a health probe may
+      # briefly wait for a sync worker slot; a tighter timeout risks false
+      # unhealthy flaps on the contended hosts this change targets.
+      timeout: 10s
       retries: 3
       start_period: 30s
     labels:
       com.centurylinklabs.watchtower.scope: "oro-validator"
     networks:
       - main
+    # Match sandbox container's --cpu-shares=2048 (see subnet/sandbox.py).
+    # Search-server sits on the episode hot path (every search / filter /
+    # view action the runtime executes). Leaving it at Docker's 1024 default
+    # lets the sandbox starve it on saturated hosts, elongating sandbox phase
+    # and tripping per-problem timeouts.
+    cpu_shares: 2048
     restart: unless-stopped
 
   proxy:
@@ -30,15 +53,22 @@ services:
       dockerfile: docker/proxy/Dockerfile
     container_name: shoppingbench-proxy
     environment:
-      - SEARCH_SERVER_URL=${SEARCH_SERVER_URL:-search-server}
-      - SEARCH_SERVER_PORT=${SEARCH_SERVER_PORT:-5632}
       - CHUTES_HOST=${CHUTES_HOST:-llm.chutes.ai}
       # Backend URL for fetching the live model allowlist. Defaults to
       # production; staging/dev override via BACKEND_URL env var.
       - BACKEND_URL=${BACKEND_URL:-https://api.oroagents.com}
       - BACKEND_HOST=${BACKEND_HOST:-api.oroagents.com}
+      - SESSION_RUNTIME_HOST=${SESSION_RUNTIME_HOST:-validator}
+      - SESSION_RUNTIME_PORT=${SESSION_RUNTIME_PORT:-9101}
+      - SESSION_CALL_TIMEOUT=${SESSION_CALL_TIMEOUT:-65s}
+    # Loopback-only publish. Sandbox agents reach the proxy over the `main`
+    # docker network (`SANDBOX_PROXY_URL=http://proxy:80`), so no host publish
+    # is required for normal operation. Keeping a loopback publish preserves
+    # `docker/README.md`'s operator debugging path (`curl localhost:8080/health`)
+    # and integration-test wait-for-healthy in `tests/integration/conftest.py`
+    # without exposing the port on any external interface.
     ports:
-      - "${PROXY_PORT:-8080}:80"
+      - "127.0.0.1:${PROXY_PORT:-8080}:80"
     networks:
       - main
       - sandbox
@@ -50,6 +80,11 @@ services:
       start_period: 10s
     labels:
       com.centurylinklabs.watchtower.scope: "oro-validator"
+    # Match sandbox container's --cpu-shares=2048. Proxy fans every
+    # /inference and /environment/call request from the sandbox; if
+    # sandbox outweighs proxy under CPU pressure, both inference and
+    # tool round-trips stall.
+    cpu_shares: 2048
     restart: unless-stopped
 
   sandbox:
@@ -116,8 +151,38 @@ services:
       - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
       - NETUID=${NETUID:-15}
       - SUBTENSOR_NETWORK=${SUBTENSOR_NETWORK:-finney}
+      # Optional private subtensor RPC. When set, wins over SUBTENSOR_NETWORK
+      # so validators can point at their own node and avoid the shared
+      # foundation-finney 429s. Empty = fall back to the network's default
+      # public endpoint via bittensor's network→endpoint resolver.
+      - SUBTENSOR_CHAIN_ENDPOINT=${SUBTENSOR_CHAIN_ENDPOINT:-}
       - ORO_BACKEND_URL=${BACKEND_URL:-https://api.oroagents.com}
+      - ORO_SESSION_RUNTIME_PORT=${SESSION_RUNTIME_PORT:-9101}
+      - ORO_SESSION_SIMULATOR_TIMEOUT=${ORO_SESSION_SIMULATOR_TIMEOUT:-60}
+      # Optional startup preflight for an operator-selected immutable pack.
+      # Pack-bound claimed work selects the generated evaluator automatically.
+      - ORO_ENVIRONMENT_RUNTIME_ENABLED=${ORO_ENVIRONMENT_RUNTIME_ENABLED:-false}
+      - ORO_ENVIRONMENT_PREFLIGHT_PACK_SHA256=${ORO_ENVIRONMENT_PREFLIGHT_PACK_SHA256:-}
       - WATCHTOWER_TOKEN=${WATCHTOWER_TOKEN:-oro-watchtower-token}
+      # bittensor 10.3+ ships CLI parsing OFF by default (BT_NO_PARSE_CLI_ARGS
+      # defaults to "true" in `bittensor.core.config.no_parse_cli`), so
+      # `Config(parser)` early-returns without applying `--wallet.name`,
+      # `--wallet.hotkey`, `--netuid`, `--subtensor.network`. We DO drive the
+      # validator from those flags in the `command:` block below, so flip it
+      # back on. Without this the container silently falls to
+      # `netuid=None, network=finney, wallet=default` and crashes in
+      # `metagraph()` before the run loop starts.
+      - BT_NO_PARSE_CLI_ARGS=false
+      # Opt-in shadow scoring. When set, the validator computes a
+      # second cosine sim per (product, gt) title pair with the named model
+      # and logs both sims for offline comparison. Unset = no behaviour change.
+      - SHADOW_SCORE_MODEL=${SHADOW_SCORE_MODEL:-}
+      # Base multiplier for the inference-token 401 retry backoff.
+      # On-call knob for widening the retry budget during a fresh-mint
+      # propagation storm without a code change + image roll. Validated
+      # at process start (numeric, 0.1 ≤ v ≤ 30.0) — invalid values fail
+      # the container fast rather than silently poisoning eval runs.
+      - ORO_TOKEN_401_BACKOFF_BASE=${ORO_TOKEN_401_BACKOFF_BASE:-}
     command:
       - "--wallet.name"
       - "${WALLET_NAME:-default}"
@@ -130,6 +195,14 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+    # Restore Docker Desktop's host.docker.internal magic hostname (the `dns:`
+    # override above strips it). Local dev can point BACKEND_URL at a Backend
+    # running on the host machine. No-op on production hosts: nothing in the
+    # validator dereferences this hostname unless BACKEND_URL uses it, and
+    # host-gateway resolves to the local docker bridge (~172.17.0.1 on
+    # Linux) which has no listener on prod, so a lookup would just fail.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     labels:
       com.centurylinklabs.watchtower.scope: "oro-validator"
     networks:
@@ -195,18 +268,40 @@ services:
       - main
     restart: unless-stopped
 
-  # Local testing — run agent against test problems, print score, exit
+  # Local generated evaluation, using the existing miner command and .env.
+  test-search-server:
+    image: ${LOCAL_SEARCH_SERVER_IMAGE:-ghcr.io/oro-ai/oro/search-server:${IMAGE_TAG:-stable}}
+    profiles:
+      - test
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5632
+      - SEARCH_WORKERS=${SEARCH_WORKERS:-}
+      - _JAVA_OPTIONS=${_JAVA_OPTIONS:--Xmx1g -Xms256m}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5632/health').read()\""]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - main
+    restart: unless-stopped
+
   test:
-    image: ghcr.io/oro-ai/oro/validator:${IMAGE_TAG:-stable}
+    image: ${LOCAL_TEST_IMAGE:-oro-local-test:local}
+    pull_policy: build
     build:
       context: .
       dockerfile: docker/validator/Dockerfile
+      args:
+        RUNTIME_PROFILE: local-test
     profiles:
       - test
     depends_on:
-      search-server:
+      test-search-server:
         condition: service_healthy
-      proxy:
+      test-proxy:
         condition: service_healthy
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -214,16 +309,51 @@ services:
       - ./logs:/app/logs
     environment:
       - HOST_PROJECT_DIR=${PWD}
+      - PYTHONPATH=/workspace:/app
+      - LOCAL_OUTPUT_ROOT=/app/logs/environment-runs
       - SANDBOX_IMAGE=${SANDBOX_IMAGE:-ghcr.io/oro-ai/oro/sandbox:${IMAGE_TAG:-stable}}
-      - SANDBOX_NETWORK=sandbox-network
+      - SANDBOX_NETWORK=${COMPOSE_PROJECT_NAME:-shoppingbench}-test-sandbox
+      - SANDBOX_MODEL=${SANDBOX_MODEL:-deepseek-ai/DeepSeek-V3.2-TEE}
       - CHUTES_API_KEY=${CHUTES_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - INFERENCE_PROVIDER=${INFERENCE_PROVIDER:-}
-    # Use the venv interpreter — bare `python` is the system Python and
-    # has no project dependencies installed (e.g. `requests`).
-    entrypoint: [".venv/bin/python", "-m", "subnet.test_runner"]
+      - LOCAL_ENV_PACK_PATH=${LOCAL_ENV_PACK_PATH:-/workspace/data/local-test/env-pack.tar.gz}
+      - LOCAL_ENV_PACK_SHA256=${LOCAL_ENV_PACK_SHA256:-f87d7f1412809f6c7dcb4cbef52c6d3661292fbb5d6743c174909fd22f15d7f5}
+      - LOCAL_MAX_WORKERS=${LOCAL_MAX_WORKERS:-7}
+      - LOCAL_TIMEOUT=${LOCAL_TIMEOUT:-1800}
+      - SEARCH_SERVER_URL=http://test-search-server:5632
+    working_dir: /workspace
+    entrypoint: ["/app/.venv/bin/python", "-m", "subnet.local_generated_validator"]
+    # Compose run omits service aliases. Sharing the local proxy's network
+    # namespace lets it reach this run's session server on loopback.
+    network_mode: service:test-proxy
+    restart: "no"
+
+  test-proxy:
+    image: ghcr.io/oro-ai/oro/proxy:${IMAGE_TAG:-stable}
+    build:
+      context: .
+      dockerfile: docker/proxy/Dockerfile
+    profiles:
+      - test
+    environment:
+      - CHUTES_HOST=${CHUTES_HOST:-llm.chutes.ai}
+      - BACKEND_URL=${BACKEND_URL:-https://api.oroagents.com}
+      - BACKEND_HOST=${BACKEND_HOST:-api.oroagents.com}
+      - SESSION_RUNTIME_HOST=127.0.0.1
+      - SESSION_RUNTIME_PORT=9101
+      - SESSION_CALL_TIMEOUT=${SESSION_CALL_TIMEOUT:-65s}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://127.0.0.1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
-      - main
+      main:
+      test-sandbox:
+        aliases:
+          - proxy
     restart: "no"
 
 volumes:
@@ -236,5 +366,9 @@ networks:
     driver: bridge
   sandbox:
     name: sandbox-network
+    driver: bridge
+    internal: true
+  test-sandbox:
+    name: ${COMPOSE_PROJECT_NAME:-shoppingbench}-test-sandbox
     driver: bridge
     internal: true

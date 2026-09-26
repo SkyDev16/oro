@@ -5,7 +5,7 @@ This directory contains Docker configuration for running ShoppingBench services 
 ## Services
 
 - **Search Server**: Provides product search functionality
-- **Proxy**: Nginx reverse proxy that routes requests to search server and Chutes API
+- **Proxy**: Nginx reverse proxy that routes agent requests to the session runtime and the inference providers
 
 ## Search Server
 
@@ -14,7 +14,7 @@ The search server provides product search functionality via a REST API.
 ### Prerequisites
 
 - Docker and Docker Compose installed
-- **Pre-built indexes**: The `indexes/` directory must exist and be built before building the Docker image
+- **Pre-built indexes and sidecar**: The `indexes/` and `sidecar/` directories must exist before building the base Docker image
 
 ### Building the Indexes (One-time Setup)
 
@@ -42,7 +42,7 @@ The Dockerfile assumes the indexes are already built and copies them into the im
 To build the image:
 
 ```bash
-docker-compose build search-server
+docker compose build search-server
 ```
 
 Or build directly:
@@ -51,12 +51,13 @@ Or build directly:
 docker build -f docker/search-server/Dockerfile -t shoppingbench-search-server .
 ```
 
-**Note**: 
-- The build process copies the pre-built `indexes/` directory into the image
-- No `documents.jsonl` is needed at build time (all data is in the index)
+**Note**:
+- The base image contains the pre-built `indexes/` and `sidecar/` directories and its identity manifest
+- A new index is released as a new pinned base image; the server never switches indexes at runtime
+- No `documents.jsonl` is needed at code-layer build time (all data is in the index and sidecar)
 - Build is fast since it skips index building (~3.1GB copy vs minutes of indexing)
 - Docker automatically caches image layers - subsequent builds will be much faster if only code or indexes change
-- Images built locally persist and are automatically reused by `docker-compose` (no need to rebuild if images already exist)
+- Images built locally persist and are automatically reused by `docker compose` (no need to rebuild if images already exist)
 
 ### Running the Service
 
@@ -64,13 +65,13 @@ docker build -f docker/search-server/Dockerfile -t shoppingbench-search-server .
 
 ```bash
 # Start the service
-docker-compose up -d search-server
+docker compose up -d search-server
 
 # View logs
-docker-compose logs -f search-server
+docker compose logs -f search-server
 
 # Stop the service
-docker-compose down
+docker compose down
 ```
 
 #### Using Docker directly
@@ -90,6 +91,7 @@ Configure via `.env` file or environment variables:
 
 - `HOST`: Server host (default: `0.0.0.0`)
 - `PORT`: Server port (default: `5632`)
+- `SIDECAR_DIR`: Directory for the columnar filter sidecar (default: `sidecar`; falls back to decode path if absent)
 
 Example `.env` file:
 
@@ -104,7 +106,7 @@ PORT=5632
    ```bash
    curl http://localhost:5632/health
    ```
-   Should return: `{"status":"healthy","service":"search-server"}`
+   Returns the service status and baked search identity, including the index and documents hashes.
 
 2. **Check API usage**:
    ```bash
@@ -117,6 +119,16 @@ PORT=5632
    curl "http://localhost:5632/find_product?q=shoes&page=1"
    ```
    Should return a JSON array of products
+
+   Trusted generator/runtime components can use pure BM25 search through:
+   ```bash
+   curl "http://localhost:5632/internal/bm25?q=travel%20mug&k=10"
+   ```
+
+   An index declaring `oro.lucene.catalog.v2` also exposes task-runtime catalog
+   search, batch product lookup, and structured filtering under `/internal/catalog/`.
+   These loopback-only operations hydrate the existing agent tools; they are not a
+   new miner-facing API.
 
 4. **Test product information endpoint**:
    ```bash
@@ -158,7 +170,7 @@ Other services in the same Docker network can access it using the service name.
 View logs:
 ```bash
 # Docker Compose
-docker-compose logs -f search-server
+docker compose logs -f search-server
 
 # Docker
 docker logs -f shoppingbench-search-server
@@ -174,7 +186,7 @@ Docker automatically caches image layers, which significantly speeds up rebuilds
 
 - **Layer caching**: Docker caches each layer (instruction) in the Dockerfile
 - **Cache invalidation**: If a layer changes, all subsequent layers are rebuilt
-- **Automatic reuse**: `docker-compose` automatically uses cached images if they exist
+- **Automatic reuse**: `docker compose` automatically uses cached images if they exist
 
 ### Optimizing Build Times
 
@@ -193,8 +205,8 @@ If you've built images before, Docker will automatically reuse them:
 # Check if images exist
 docker images | grep shoppingbench
 
-# Images are automatically reused by docker-compose
-docker-compose up -d  # Uses cached images if available
+# Images are automatically reused by docker compose
+docker compose up -d  # Uses cached images if available
 ```
 
 ### Clearing Caches
@@ -220,17 +232,18 @@ The proxy service acts as a gateway for sandboxed agent containers, providing co
 - **Proxy Container**: Only container with internet access, runs nginx reverse proxy
 - **Sandbox Network**: Internal Docker network (no internet access) for agent containers
 - **Path-based Routing**:
-  - `/search/*` → search-server
+  - `/environment/call` → session runtime (ORO Bench tool actions)
   - `/inference/*` → Chutes API (external, auth forwarded from sandbox client)
+  - `/search/*` → 410 Gone (ShoppingBench routes, removed)
 
 ### Network Topology
 
 ```
 Internet
   ↓
-Bridge Network (default, has internet)
-  ├─→ search-server (accessible from host via port mapping)
-  └─→ proxy (connected to bridge for internet + search-server access)
+`main` network (shoppingbench-main, has internet)
+  ├─→ search-server (on the `main` network; loopback publish for operator checks)
+  └─→ proxy (on `main` for internet access)
         ↓
         └─→ sandbox network (internal, no internet)
               ├─→ proxy (accessible from agent containers)
@@ -241,13 +254,13 @@ Bridge Network (default, has internet)
 
 ```bash
 # Build proxy image
-docker-compose build proxy
+docker compose build proxy
 
-# Start proxy (requires search-server to be running)
-docker-compose up -d proxy
+# Start proxy
+docker compose up -d proxy
 
 # View logs
-docker-compose logs -f proxy
+docker compose logs -f proxy
 ```
 
 ### Environment Variables
@@ -257,8 +270,6 @@ Configure via `.env` file:
 ```bash
 # Proxy configuration
 PROXY_PORT=8080  # Port exposed on host
-SEARCH_SERVER_URL=search-server  # Service name for search-server
-SEARCH_SERVER_PORT=5632  # Port of search-server
 ```
 
 ### Agent Container Configuration
@@ -270,13 +281,14 @@ SANDBOX_PROXY_URL=http://proxy:80
 ```
 
 This allows agent containers to access services through the proxy:
-- `http://proxy:80/search/find_product` → search-server
+- `http://proxy:80/environment/call` → session runtime
+- `http://proxy:80/inference/chat/completions` → inference providers
 
 ### Network Isolation
 
 - **Agent containers** are placed on the `sandbox` network (internal, no internet access)
-- **Proxy** is on both `bridge` (for internet + search-server) and `sandbox` (for agent containers)
-- **Search-server** is on default `bridge` network (accessible from host and proxy)
+- **Proxy** is on both `main` (for internet) and `sandbox` (for agent containers)
+- **Search-server** is on the `main` network (reachable by the validator runtime and, via loopback publish, the host; never by the sandbox)
 
 ### Verifying the Proxy
 
@@ -284,6 +296,6 @@ This allows agent containers to access services through the proxy:
 # Health check
 curl http://localhost:8080/health
 
-# Test search routing through proxy
-curl "http://localhost:8080/search/find_product?q=shoes&page=1"
+# Legacy search routes are gone
+curl -i "http://localhost:8080/search/find_product?q=shoes"   # HTTP 410
 ```

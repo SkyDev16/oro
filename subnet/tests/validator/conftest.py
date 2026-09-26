@@ -7,12 +7,11 @@ import types
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
-from uuid import UUID
 
 import pytest
 from bittensor_wallet import Keypair, Wallet
 
-from oro_sdk.models import HeartbeatResponse, TopAgentResponse
+from oro_sdk.models import HeartbeatResponse
 
 # Stub bittensor.utils.btlogging when the real module is unavailable so any
 # test importing progress_reporter (which imports btlogging at module import)
@@ -30,7 +29,7 @@ if "bittensor.utils.btlogging" not in sys.modules:
         )
         sys.modules["bittensor.utils.btlogging"] = _btlogging
 
-from validator.backend_client import BackendClient
+from validator.backend_client import BackendClient, WeightSalt
 
 
 # =============================================================================
@@ -71,7 +70,11 @@ def mock_backend_client():
 
     Test files can configure specific method return values as needed.
     """
-    return MagicMock(spec=BackendClient)
+    client = MagicMock(spec=BackendClient)
+    # Default: no overlay, no epoch-pinned standings (matches a dark Backend).
+    # Set explicitly so tests don't depend on MagicMock's default behaviour.
+    client.fetch_weight_salt.return_value = WeightSalt(overlay={}, epoch_standings=None)
+    return client
 
 
 @pytest.fixture
@@ -128,21 +131,5 @@ def mock_backend_client_with_heartbeat(mock_backend_client):
     """Mock BackendClient configured for heartbeat tests."""
     mock_backend_client.heartbeat.return_value = HeartbeatResponse(
         lease_expires_at=datetime.now() + timedelta(minutes=5)
-    )
-    return mock_backend_client
-
-
-@pytest.fixture
-def mock_backend_client_with_top_miner(mock_backend_client):
-    """Mock BackendClient configured for weight setter tests.
-
-    Returns "5GrwvaEF..." as top miner, which is at index 1 in mock_metagraph.
-    """
-    mock_backend_client.get_top_miner.return_value = TopAgentResponse(
-        suite_id=789,
-        top_agent_version_id=UUID("87654321-4321-4321-4321-210987654321"),
-        top_miner_hotkey="5GrwvaEF...",  # Matches mock_metagraph index 1
-        top_score=0.92,
-        computed_at=datetime.now(),
     )
     return mock_backend_client

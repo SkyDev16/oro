@@ -1,4 +1,5 @@
-FROM python:3.10-slim
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim
 
 # Install Docker CLI (for spawning sandbox containers via host socket)
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -13,15 +14,16 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# Install all dependencies from lockfile — fully deterministic builds.
-# The lockfile pins every transitive dependency so fresh builds always
-# get identical packages regardless of upstream releases.
+# Install all dependencies from the shared lockfile. The mutually exclusive
+# profiles select the hosted v6 runtime or miner-local v5 runtime without
+# duplicating the rest of the dependency graph.
 COPY docker/validator/pyproject.toml docker/validator/uv.lock /app/
-RUN uv sync --frozen --no-dev --no-install-project
+ARG RUNTIME_PROFILE=validator
+RUN uv sync --frozen --no-install-project --no-default-groups --group ${RUNTIME_PROFILE}
 
-# Pre-cache SentenceTransformer model (avoids runtime download)
-ARG HF_TOKEN=""
-RUN HF_HUB_ENABLE_HF_TRANSFER=0 HF_TOKEN=${HF_TOKEN} .venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')"
+# Pre-cache the canonical sentence model (avoids runtime download).
+RUN --mount=type=secret,id=hf_token,env=HF_TOKEN,required=false \
+    HF_HUB_ENABLE_HF_TRANSFER=0 .venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
 
 # Copy validator code
 COPY subnet/ /app/subnet/
@@ -37,7 +39,22 @@ COPY src/__init__.py /app/src/
 
 # Copy data files (test problems for local testing)
 COPY data/ /app/data/
+COPY trajectory-viewer/ /app/trajectory-viewer/
 
 ENV PYTHONPATH=/app
+
+# bittensor 10.3+ ships CLI parsing OFF by default
+# (`bittensor.core.config.no_parse_cli` reads `BT_NO_PARSE_CLI_ARGS` and
+# defaults it to "true"), which makes `Config(parser)` early-return
+# without applying our `--wallet.name`/`--wallet.hotkey`/`--netuid`/
+# `--subtensor.network` command-line arguments. Without those the
+# validator falls back to class defaults `netuid=None, wallet=default,
+# network=finney` and crashes at metagraph sync inside the runtime
+# panic `NeuronInfoRuntimeApi::get_neurons_lite(None)`.
+#
+# Baked into the image (not just docker-compose.yml) so operators
+# whose compose file hasn't been re-pulled since PR #229 don't crash
+# on Watchtower auto-update.
+ENV BT_NO_PARSE_CLI_ARGS=false
 
 ENTRYPOINT [".venv/bin/python", "-m", "subnet.validator.main"]

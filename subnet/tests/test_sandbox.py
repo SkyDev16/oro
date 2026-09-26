@@ -117,6 +117,9 @@ class TestBuildSandboxCommand:
         assert "/tmp/problems.jsonl" in cmd
         assert "--output" in cmd
         assert "/app/logs/output.jsonl" in cmd
+        assert (
+            "ORO_ENVIRONMENT_SESSIONS_FILE=/app/logs/environment_sessions.json" in cmd
+        )
 
     def test_no_enable_scoring_flag(self):
         cmd = build_sandbox_command(
@@ -126,6 +129,27 @@ class TestBuildSandboxCommand:
             output_path="/app/logs/output.jsonl",
         )
         assert "--enable-scoring" not in cmd
+
+    def test_log_size_capped(self):
+        cmd = build_sandbox_command(
+            agent_host_path="/host/agent.py",
+            logs_host_path="/host/logs",
+            problem_file_arg="/tmp/problems.jsonl",
+            output_path="/app/logs/output.jsonl",
+        )
+        # `max-size` / `max-file` are only accepted by the json-file / local
+        # drivers; awslogs (prod's daemon default) errors at
+        # container-create if we hand them anything else. Assert the driver
+        # is set explicitly so behavior is host-independent and each opt
+        # sits directly after its `--log-opt` flag.
+        drv_idx = cmd.index("--log-driver")
+        assert cmd[drv_idx + 1] == "json-file"
+
+        for value in ("max-size=10m", "max-file=1"):
+            value_idx = cmd.index(value)
+            assert cmd[value_idx - 1] == "--log-opt", (
+                f"{value} must directly follow --log-opt, got {cmd[value_idx - 1]}"
+            )
 
     def test_extra_volumes_mounted_readonly(self):
         cmd = build_sandbox_command(
@@ -171,6 +195,26 @@ class TestBuildSandboxCommand:
         assert cmd[net_idx + 1] == "custom-net"
         assert "custom:latest" in cmd
 
+    def test_container_name_sets_docker_name(self):
+        cmd = build_sandbox_command(
+            agent_host_path="/host/agent.py",
+            logs_host_path="/host/logs",
+            problem_file_arg="/tmp/problems.jsonl",
+            output_path="/app/logs/output.jsonl",
+            container_name="oro-sandbox-abc123",
+        )
+        name_idx = cmd.index("--name")
+        assert cmd[name_idx + 1] == "oro-sandbox-abc123"
+
+    def test_container_name_omitted_when_none(self):
+        cmd = build_sandbox_command(
+            agent_host_path="/host/agent.py",
+            logs_host_path="/host/logs",
+            problem_file_arg="/tmp/problems.jsonl",
+            output_path="/app/logs/output.jsonl",
+        )
+        assert "--name" not in cmd
+
     def test_resource_limits_present(self):
         """Verify Docker resource limits are included in the command."""
         cmd = build_sandbox_command(
@@ -187,15 +231,18 @@ class TestBuildSandboxCommand:
         # PIDs
         pids_idx = cmd.index("--pids-limit")
         assert cmd[pids_idx + 1] == "256"
-        # File descriptors
+        # File descriptors — bumped to 4096 so a SANDBOX_MAX_WORKERS=60 agent
+        # holding ~5 sockets per worker doesn't silently hit the 1024 cap.
         ulimit_idx = cmd.index("--ulimit")
-        assert cmd[ulimit_idx + 1] == "nofile=1024:1024"
+        assert cmd[ulimit_idx + 1] == "nofile=4096:4096"
         # Non-root user
         user_idx = cmd.index("--user")
         assert cmd[user_idx + 1] == "1000:1000"
-        # CPU shares — sandbox at half the default so validator preempts under contention
+        # CPU shares — 2x the default so smaller validator hosts don't starve
+        # sandbox workers at high SANDBOX_MAX_WORKERS while the validator main
+        # thread is blocked in subprocess.run() anyway.
         shares_idx = cmd.index("--cpu-shares")
-        assert cmd[shares_idx + 1] == "512"
+        assert cmd[shares_idx + 1] == "2048"
 
     def test_inference_access_token_injected(self):
         cmd = build_sandbox_command(
@@ -205,9 +252,9 @@ class TestBuildSandboxCommand:
             output_path="/app/logs/output.jsonl",
             inference_access_token="miner-token-abc",
         )
-        # Token should be injected as both CHUTES_ACCESS_TOKEN and INFERENCE_ACCESS_TOKEN env vars
-        assert "CHUTES_ACCESS_TOKEN=miner-token-abc" in cmd
+        # Token should be injected as the INFERENCE_ACCESS_TOKEN env var
         assert "INFERENCE_ACCESS_TOKEN=miner-token-abc" in cmd
+        assert not any("CHUTES_ACCESS_TOKEN" in arg for arg in cmd)
 
     def test_inference_access_token_omitted_when_none(self):
         cmd = build_sandbox_command(
@@ -216,7 +263,7 @@ class TestBuildSandboxCommand:
             problem_file_arg="/tmp/problems.jsonl",
             output_path="/app/logs/output.jsonl",
         )
-        assert not any("CHUTES_ACCESS_TOKEN" in arg for arg in cmd)
+        assert not any("INFERENCE_ACCESS_TOKEN" in arg for arg in cmd)
 
     def test_inference_access_token_omitted_when_empty(self):
         cmd = build_sandbox_command(
@@ -226,7 +273,7 @@ class TestBuildSandboxCommand:
             output_path="/app/logs/output.jsonl",
             inference_access_token="",
         )
-        assert not any("CHUTES_ACCESS_TOKEN" in arg for arg in cmd)
+        assert not any("INFERENCE_ACCESS_TOKEN" in arg for arg in cmd)
 
     def test_inference_provider_injected(self):
         cmd = build_sandbox_command(
@@ -276,7 +323,6 @@ class TestBuildSandboxCommand:
             inference_provider="custom",
             inference_base_url="https://custom.example.com",
         )
-        assert "CHUTES_ACCESS_TOKEN=test-token-123" in cmd
         assert "INFERENCE_ACCESS_TOKEN=test-token-123" in cmd
         assert "INFERENCE_PROVIDER=custom" in cmd
         assert "INFERENCE_BASE_URL=https://custom.example.com" in cmd

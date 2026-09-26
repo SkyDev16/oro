@@ -274,26 +274,99 @@ class TestBackendClientTopMiner:
     def test_get_top_miner(self, mock_wallet):
         from oro_sdk.models.top_agent_response import TopAgentResponse
 
-        client = BackendClient("https://api.example.com", mock_wallet)
-
-        sdk_response = TopAgentResponse(
+        response = TopAgentResponse(
             suite_id=789,
             computed_at=datetime(2025, 1, 13, 12, 0, 0),
-            top_agent_version_id=UUID("87654321-4321-4321-4321-210987654321"),
             top_miner_hotkey="5GrwvaEF...",
-            top_score=0.92,
         )
-
-        mock_response = _create_response(200, sdk_response)
+        client = BackendClient("https://api.example.com", mock_wallet)
 
         with patch(
             "validator.backend_client.get_top_agent.sync_detailed",
-            return_value=mock_response,
+            return_value=_create_response(200, response),
         ):
-            result = client.get_top_miner()
+            assert client.get_top_miner().top_miner_hotkey == "5GrwvaEF..."
 
-        assert result.top_miner_hotkey == "5GrwvaEF..."
-        assert result.top_score == 0.92
+
+class TestBackendClientWeightOverlay:
+    def _client(self, mock_wallet):
+        return BackendClient("https://api.example.com", mock_wallet)
+
+    def _resp(self, overlay):
+        from oro_sdk.models.weight_salt_response import WeightSaltResponse
+
+        parsed = WeightSaltResponse.from_dict(
+            {
+                "active": True,
+                "eligible": True,
+                "epoch_index": 1,
+                "weight_overlay": overlay,
+            }
+        )
+        return _create_response(200, parsed)
+
+    def test_parses_overlay_to_int_float_dict(self, mock_wallet):
+        client = self._client(mock_wallet)
+        with patch(
+            "validator.backend_client.get_weight_salt.sync_detailed",
+            return_value=self._resp({"114": 0.09, "201": 0.005}),
+        ):
+            salt = client.fetch_weight_salt()
+
+        assert salt.overlay == {114: 0.09, 201: 0.005}
+        assert salt.eligible is True
+
+    def test_empty_overlay_returns_empty(self, mock_wallet):
+        client = self._client(mock_wallet)
+        with patch(
+            "validator.backend_client.get_weight_salt.sync_detailed",
+            return_value=self._resp({}),
+        ):
+            assert client.fetch_weight_salt().overlay == {}
+
+    def test_backend_error_returns_empty_not_raises(self, mock_wallet):
+        # Fetch failure must fail safe to {} (never raise → the caller submits
+        # its base vector rather than skipping the whole tick).
+        client = self._client(mock_wallet)
+        with patch(
+            "validator.backend_client.get_weight_salt.sync_detailed",
+            side_effect=httpx.TimeoutException("timeout"),
+        ):
+            assert client.fetch_weight_salt().overlay == {}
+
+    def test_malformed_payload_returns_empty_not_raises(self, mock_wallet):
+        # A non-numeric overlay value would raise on parse — the guard must catch
+        # it and fail safe to {}, not propagate past the client boundary.
+        client = self._client(mock_wallet)
+        bad = MagicMock()
+        bad.weight_overlay.to_dict.return_value = {"5": "not-a-number"}
+        with patch(
+            "validator.backend_client.get_weight_salt.sync_detailed",
+            return_value=_create_response(200, bad),
+        ):
+            assert client.fetch_weight_salt().overlay == {}
+
+    @pytest.mark.parametrize(
+        "overlay",
+        [
+            {"5": -0.1, "6": 0.2},  # negative share
+            {"5": float("inf")},  # non-finite
+            {"5": float("nan")},  # non-finite
+            {"5": 1.5},  # > 1
+            {"5": 0.4, "6": 0.4},  # total 0.8 > MAX_OVERLAY_SHARE
+        ],
+    )
+    def test_out_of_range_shares_rejected_to_empty(self, mock_wallet, overlay):
+        # The client boundary rejects the WHOLE overlay to {} on any invalid
+        # share, so every validator falls back to the same base vector.
+        client = self._client(mock_wallet)
+        bad = MagicMock()
+        bad.weight_overlay.to_dict.return_value = overlay
+        with patch(
+            "validator.backend_client.get_weight_salt.sync_detailed",
+            return_value=_create_response(200, bad),
+        ):
+            assert client.fetch_weight_salt().overlay == {}
 
 
 class TestBackendClientUploadToS3:
@@ -312,7 +385,7 @@ class TestBackendClientUploadToS3:
         mock_response.status_code = 200
 
         with patch(
-            "validator.backend_client.requests.request", return_value=mock_response
+            "validator.backend_client._S3_SESSION.request", return_value=mock_response
         ):
             client.upload_to_s3(presign, b"test data")  # Should not raise
 
@@ -331,13 +404,38 @@ class TestBackendClientUploadToS3:
         mock_response.status_code = 403
 
         with patch(
-            "validator.backend_client.requests.request", return_value=mock_response
+            "validator.backend_client._S3_SESSION.request", return_value=mock_response
         ):
             with pytest.raises(BackendError):
                 client.upload_to_s3(presign, b"test data")
 
 
 class TestBackendClientErrorHandling:
+    @pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+    def test_transient_http_status_uses_sdk_classification(self, status):
+        from oro_sdk import is_transient_status
+
+        error = BackendError("temporary failure", status_code=status)
+        assert error.is_transient == is_transient_status(status)
+        assert error.is_transient
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422])
+    def test_permanent_http_status_is_not_retried(self, status):
+        assert not BackendError("rejected", status_code=status).is_transient
+
+    def test_rate_limited_completion_is_transient(self, mock_wallet):
+        from oro_sdk.models.terminal_status import TerminalStatus
+
+        client = BackendClient("https://api.example.com", mock_wallet)
+        with patch(
+            "validator.backend_client.complete_run.sync_detailed",
+            return_value=_create_response(429),
+        ):
+            with pytest.raises(BackendError) as exc_info:
+                client.complete_run(UUID(int=1), TerminalStatus.FAILED, failure_reason="test")
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.is_transient
+
     def test_server_error_is_transient(self, mock_wallet):
         """500 errors are transient and should be retried."""
         client = BackendClient("https://api.example.com", mock_wallet)

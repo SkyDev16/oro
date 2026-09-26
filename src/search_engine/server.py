@@ -2,40 +2,74 @@ import os
 import sys
 import ujson as json
 import multiprocessing
+from importlib.metadata import version
+from pathlib import Path
 
 from pyserini.search.lucene import LuceneSearcher
 from flask import Flask, request, jsonify
 from waitress import serve
 
-searcher = LuceneSearcher("indexes")
-print("Load indexes done.", file=sys.stderr)
+from src.search_engine import sidecar as _sidecar
+from src.search_engine.product_filters import (
+    is_filter_by_price,
+    is_filter_by_service,
+    is_filter_by_shop_id,
+    shop_id_is_canonical,
+)
+from src.search_engine.search_contract import (
+    BACKEND_ID,
+    QUERY_CONFIG,
+    SearchContractError,
+    bm25 as deterministic_bm25,
+    identity_from_manifest,
+    normalize_query,
+    parse_k,
+)
+from src.search_engine.runtime_catalog import (
+    CatalogContractError,
+    INDEX_CONTRACT_VERSION,
+    filter_candidates,
+    products as catalog_products,
+    search_candidates,
+)
+
+INDEX_DIR = Path("indexes")
+INDEX_MANIFEST = Path("lucene_manifest.json")
+
+
+def _search_identity():
+    if INDEX_MANIFEST.is_file():
+        identity = identity_from_manifest(INDEX_MANIFEST)
+        expected_pyserini = identity.get("pyserini_version")
+        if expected_pyserini and expected_pyserini != version("pyserini"):
+            raise RuntimeError("search index requires a different Pyserini version")
+        return identity
+    return {
+        "backend_id": BACKEND_ID,
+        "documents_sha256": None,
+        "index_sha256": None,
+        "query": QUERY_CONFIG,
+    }
+
+
+SEARCH_IDENTITY = _search_identity()
+searcher = LuceneSearcher(str(INDEX_DIR))
+if SEARCH_IDENTITY["index_sha256"] is not None:
+    searcher.set_bm25(
+        float(QUERY_CONFIG["bm25"]["k1"]),
+        float(QUERY_CONFIG["bm25"]["b"]),
+    )
+print(f"Loaded search index from {INDEX_DIR}.", file=sys.stderr)
+
+# Optional columnar filter sidecar (see sidecar.py). When present it replaces
+# the per-candidate json.loads in the filter scan with a memmap lookup; when
+# absent (or built from a different corpus) the search path is byte-for-byte
+# the original decode path.
+_SIDECAR = _sidecar.load(
+    os.environ.get("SIDECAR_DIR", "sidecar"), expected_num_docs=searcher.num_docs
+)
 
 app = Flask(__name__)
-
-# Lucene special characters that enable query injection
-_LUCENE_SPECIAL_CHARS = str.maketrans(
-    {
-        "+": " ",
-        "-": " ",
-        "&": " ",
-        "|": " ",
-        "!": " ",
-        "(": " ",
-        ")": " ",
-        "{": " ",
-        "}": " ",
-        "[": " ",
-        "]": " ",
-        "^": " ",
-        '"': " ",
-        "~": " ",
-        "*": " ",
-        "?": " ",
-        ":": " ",
-        "\\": " ",
-        "/": " ",
-    }
-)
 
 
 def sanitize_query(q: str) -> str:
@@ -46,14 +80,19 @@ def sanitize_query(q: str) -> str:
     parser.  Legitimate agent queries are always natural language, so
     this has no effect on valid searches.
     """
-    if not q:
-        return ""
-    return q.translate(_LUCENE_SPECIAL_CHARS).strip()
+    return normalize_query(q)
 
 
-CAPACITY = 10000
+# Two-tier BM25 candidate cap: try the cheap tier first, fall back to the
+# full cap only when the post-filter (shop_id / price / service) yield is
+# short. A regression on thousands of real find_product tuples confirmed
+# 100% top-50 identity vs the flat k=10000 path, with a large median and
+# tail latency win under concurrency.
+CAPACITY_INITIAL = 500
+CAPACITY_FULL = 10000
 PAGE_SIZE = 10
 MAX_PAGE = 5
+TARGET_HITS = PAGE_SIZE * MAX_PAGE  # final products returned across pages
 SEARCH_FIELDS = ["product_id", "shop_id", "title", "price", "service", "sold_count"]
 INFORMATION_FIELDS = [
     "product_id",
@@ -111,28 +150,6 @@ def process_service(service):
     return results
 
 
-def is_filter_by_price(product, price):
-    low, high = price
-    if low is not None and product["price"] < low:
-        return True
-    if high is not None and product["price"] > high:
-        return True
-    return False
-
-
-def is_filter_by_service(product, service):
-    for serv in service:
-        if serv not in product.get("service", []):
-            return True
-    return False
-
-
-def is_filter_by_shop_id(product, shop_id):
-    if shop_id and shop_id != product.get("shop_id"):
-        return True
-    return False
-
-
 def search(q, page, shop_id=None, price=None, sort=None, service=None):
     page = process_page(page)
     price = process_price(price)
@@ -150,19 +167,69 @@ def search(q, page, shop_id=None, price=None, sort=None, service=None):
     if not q:
         return products
 
-    # filter by shop_id & price & service
-    hits = searcher.search(q=q, k=CAPACITY, remove_dups=True)
-    for hit in hits:
+    # Sidecar fast path: when the sidecar is loaded we decide shop/price/service
+    # from the memmap columns and only decode the <=TARGET_HITS survivors,
+    # yielding identical results to the decode path (same fields, same order).
+    # A shop_id that cannot be compared as an int with identical results (see
+    # shop_id_is_canonical) disables the fast path for that call.
+    use_sidecar = _SIDECAR is not None
+    shop_id_int = None
+    if shop_id:
+        if shop_id_is_canonical(shop_id):
+            shop_id_int = int(shop_id)
+        else:
+            use_sidecar = False
+    reqmask = _SIDECAR.reqmask(service) if use_sidecar else 0
+
+    def _decode_and_filter(hit, out):
+        # Original path: decode the full product and apply the predicates.
         product = json.loads(searcher.doc(hit.docid).raw())["product"]
         if is_filter_by_shop_id(product, shop_id):
-            continue
+            return
         if is_filter_by_price(product, price):
-            continue
+            return
         if is_filter_by_service(product, service):
-            continue
-        products.append(product)
-        if len(products) >= MAX_PAGE * PAGE_SIZE:
-            break
+            return
+        out.append(product)
+
+    def _collect(k):
+        # Score the top-k BM25 candidates, apply post-filters, stop as soon
+        # as we have enough surviving products for the paginated response.
+        # Returns (products, len(hits)) so the caller can distinguish
+        # "corpus ran out" from "post-filter dropped everything".
+        out = []
+        hits = searcher.search(q=q, k=k, remove_dups=True)
+        for hit in hits:
+            if use_sidecar:
+                i = _SIDECAR.lookup(hit.docid)
+                if i is not None:
+                    verdict = _SIDECAR.rejects(i, shop_id_int, price, reqmask)
+                    if verdict is True:
+                        continue
+                    if verdict is False:
+                        # Survivor: decode the full product for sort + projection.
+                        out.append(json.loads(searcher.doc(hit.docid).raw())["product"])
+                    else:
+                        # Undecided (e.g. null price under a price filter):
+                        # defer to the decode path so behavior is identical.
+                        _decode_and_filter(hit, out)
+                    if len(out) >= TARGET_HITS:
+                        break
+                    continue
+                # Not in sidecar (should not happen for indexed docs): fall
+                # through to the decode path for this candidate.
+            _decode_and_filter(hit, out)
+            if len(out) >= TARGET_HITS:
+                break
+        return out, len(hits)
+
+    # Two-tier fetch: k=CAPACITY_INITIAL almost always fills unfiltered
+    # queries and most filtered queries; escalate to CAPACITY_FULL only
+    # when the yield is short AND the searcher actually still has more
+    # candidates to score.
+    products, hits_seen = _collect(CAPACITY_INITIAL)
+    if len(products) < TARGET_HITS and hits_seen >= CAPACITY_INITIAL:
+        products, _ = _collect(CAPACITY_FULL)
 
     # sort
     if sort == "order":
@@ -207,7 +274,76 @@ def index():
 @app.route("/health")
 def health():
     """Health check endpoint for Docker orchestration"""
-    return jsonify({"status": "healthy", "service": "search-server"}), 200
+    return jsonify(
+        {
+            "status": "healthy",
+            "service": "search-server",
+            "search": SEARCH_IDENTITY,
+        }
+    ), 200
+
+
+@app.route("/internal/bm25")
+def internal_bm25():
+    if SEARCH_IDENTITY["index_sha256"] is None:
+        return jsonify({"error": "baked search index identity is unavailable"}), 503
+    try:
+        k = parse_k(request.args.get("k"))
+    except SearchContractError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(deterministic_bm25(searcher, request.args.get("q"), k))
+
+
+def _require_runtime_catalog():
+    if SEARCH_IDENTITY.get("index_contract") != INDEX_CONTRACT_VERSION:
+        return jsonify({"error": "runtime catalog index is unavailable"}), 503
+    return None
+
+
+@app.route("/internal/catalog/search")
+def internal_catalog_search():
+    unavailable = _require_runtime_catalog()
+    if unavailable is not None:
+        return unavailable
+    try:
+        k = parse_k(request.args.get("k"))
+        hits = deterministic_bm25(searcher, request.args.get("q"), k)
+        result = search_candidates(searcher, hits)
+    except (CatalogContractError, SearchContractError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+
+@app.route("/internal/catalog/products", methods=["POST"])
+def internal_catalog_products():
+    unavailable = _require_runtime_catalog()
+    if unavailable is not None:
+        return unavailable
+    payload = request.get_json(silent=True)
+    product_ids = payload.get("product_ids") if isinstance(payload, dict) else None
+    try:
+        result = catalog_products(searcher, product_ids)
+    except CatalogContractError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+
+@app.route("/internal/catalog/filter")
+def internal_catalog_filter():
+    unavailable = _require_runtime_catalog()
+    if unavailable is not None:
+        return unavailable
+    try:
+        result = filter_candidates(
+            searcher,
+            category_terms=request.args.getlist("category"),
+            brand_terms=request.args.getlist("brand"),
+            max_price_term=request.args.get("max_price"),
+            limit=int(request.args.get("limit", "30")),
+        )
+    except (CatalogContractError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
 
 
 @app.route("/find_product")
@@ -269,7 +405,7 @@ if __name__ == "__main__":
     # Log startup information for Docker visibility
     print(f"Starting search server on {host}:{port}", file=sys.stderr)
     print(f"Using {threads} threads", file=sys.stderr)
-    print("Index directory: indexes", file=sys.stderr)
+    print(f"Index directory: {INDEX_DIR}", file=sys.stderr)
 
     # Get connection limit from environment (default: 1000)
     connection_limit = int(os.getenv("WAITRESS_CONNECTION_LIMIT", "1000"))

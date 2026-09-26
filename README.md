@@ -29,13 +29,34 @@ ORO is a Bittensor subnet (SN15) that evaluates AI agents on real-world shopping
 
 ## For Miners
 
-Miners submit Python agents that define an `agent_main()` function. Inside the sandbox, your agent can search 2.5M real products, view product details, and make recommendations — all scored against ground truth.
-
-Available tools: `find_product`, `view_product_information`, `recommend_product`
+Miners submit Python agents that define an `agent_main(problem_data)` function. The validator injects a per-task `problem_data["environment"]` object — the agent reads its `binding` and `policy_view.tools`, then drives the shopping session by calling the runtime-supplied tools until the environment reports `done=true`.
 
 **Get started:** [Miner Quickstart Guide](https://docs.oroagents.com/docs/miners/quick-start) — build an agent, test locally with Docker, and submit to the network.
 
-See [`src/agent/agent.py`](src/agent/agent.py) for a reference agent implementation.
+See [`src/agent/environment_agent.py`](src/agent/environment_agent.py) for the reference agent implementation. It's the shape production expects and matches the [agent interface docs](https://docs.oroagents.com/docs/miners/agent-interface).
+
+### Test generated environments locally
+
+Local testing validates the bundled 30-task qualifying EnvPack, then runs all
+five tasks from each of the six included families through the
+generated runtime and family verifiers. The exact release pack is included at
+`data/local-test/env-pack.tar.gz` using Git LFS.
+
+Keep your inference credentials in `.env`, with `INFERENCE_PROVIDER` selecting
+between keys when both are present. `SANDBOX_MODEL` optionally overrides the
+included reference agent. Custom agents may use any models permitted by the
+live Backend allowlist. Run from the repository root:
+
+```bash
+docker compose run test --agent-file src/agent/environment_agent.py
+```
+
+The command prints per-family rewards, the models in play, the aggregate, and
+an artifact directory under `logs/environment-runs/` that includes a
+self-contained `trajectories.html` for stepping through every episode. Generated agents use the environment's dynamic
+tools and `policy_view`; `src/agent/environment_agent.py` is the reference.
+See [the miner guide](docs/miner-guide.md#local-testing) for image setup,
+configuration, and outputs.
 
 ## For Validators
 
@@ -72,7 +93,7 @@ Full documentation at **[docs.oroagents.com](https://docs.oroagents.com)**:
 | | Miners | Validators | Platform |
 |---|--------|------------|----------|
 | Getting started | [Quickstart](https://docs.oroagents.com/docs/miners/quick-start) | [Overview](https://docs.oroagents.com/docs/validators/overview) | [Architecture](https://docs.oroagents.com/docs/architecture) |
-| Reference | [Agent Interface](https://docs.oroagents.com/docs/miners/agent-interface) | [Configuration](https://docs.oroagents.com/docs/validators/configuration) | [API Endpoints](https://docs.oroagents.com/docs/api/endpoints) |
+| Reference | [Agent Interface](https://docs.oroagents.com/docs/miners/agent-interface) | [Configuration](https://docs.oroagents.com/docs/validators/configuration) | [API Endpoints](https://docs.oroagents.com/docs/api) |
 | Testing | [Local Testing](https://docs.oroagents.com/docs/miners/local-testing) | [Installation](https://docs.oroagents.com/docs/validators/installation) | [FAQ](https://docs.oroagents.com/docs/resources/faq) |
 
 ## License

@@ -31,9 +31,17 @@ http {
     # Rate limiting zone: 30 requests/second per client IP
     limit_req_zone $binary_remote_addr zone=agent:10m rate=30r/s;
 
+    # Return 429 (Too Many Requests) instead of the nginx default 503 when an
+    # agent bursts past the cap. 503 misleads agent authors — it reads as
+    # "server broken" so agents either give up or spam-retry with no backoff.
+    # 429 is the correct HTTP semantic for a client-side rate breach and lets
+    # a well-behaved agent add jitter/backoff without polluting real 5xx
+    # dashboards.
+    limit_req_status 429;
+
     # Combined access log + upstream metadata + per-request outcome label.
     # `$upstream_status` propagates the upstream HTTP status when a parent
-    # location uses `proxy_pass` (e.g. /search/*) but stays `-` when the
+    # location uses `proxy_pass` (e.g. /environment/call) but stays `-` when the
     # parent uses `js_content` and dispatches to upstream via an njs
     # subrequest (e.g. /inference/). `$proxy_outcome` covers the gap for the
     # inference path — see js_set above and validate_model.js. CloudWatch
@@ -71,36 +79,21 @@ http {
 
         # Default deny — block any path not explicitly handled below
         location / {
+            default_type application/json;
             return 403 '{"error": "forbidden"}\n';
-            add_header Content-Type application/json;
         }
 
-        # Block agent access to scoring-only endpoint (returns full product docs)
-        location /search/get_product_raw {
-            return 403 '{"error": "forbidden"}\n';
-            add_header Content-Type application/json;
-        }
-
-        # Route /search/* requests to search-server
-        location /search/ {
-            limit_req zone=agent burst=50 nodelay;
-
-            # Re-resolve Docker DNS on every request so container IP changes
-            # (e.g. from Watchtower image updates) are picked up automatically.
-            resolver 127.0.0.11 valid=10s;
-            set $search_upstream http://${SEARCH_SERVER_URL}:${SEARCH_SERVER_PORT};
-
-            # Strip /search prefix and forward to search-server
-            rewrite ^/search/(.*) /$1 break;
-            proxy_pass $search_upstream;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-
-            proxy_connect_timeout 300s;
-            proxy_send_timeout 300s;
-            proxy_read_timeout 300s;
+        # ShoppingBench-era search routes. The ORO Bench runtime talks to the
+        # search-server directly on /internal/*; agents only ever see catalog
+        # data through /environment/call. The raw product record exposed here
+        # carried the verifier's normalized attribute keys straight to the
+        # sandbox with no turn cost and no trace, so the routes are
+        # gone rather than forwarded. 410 (not the generic 403) so a client
+        # can tell a removal from a permissions error. `return` consults
+        # default_type, not add_header, for the Content-Type of its body.
+        location ~ ^/search(/|$) {
+            default_type application/json;
+            return 410 '{"error": "ShoppingBench search routes were removed; use the ORO Bench environment tools via /environment/call"}\n';
         }
 
         # Route /inference/* requests through njs model validation
@@ -110,19 +103,39 @@ http {
             js_content validate_model.validate;
         }
 
+        # Stateful actions terminate in the validator process. Session
+        # creation and verdict endpoints are intentionally not exposed.
+        location = /environment/call {
+            limit_req zone=agent burst=50 nodelay;
+
+            resolver 127.0.0.11 valid=10s;
+            set $session_upstream http://${SESSION_RUNTIME_HOST}:${SESSION_RUNTIME_PORT};
+            proxy_pass $session_upstream/v1/session/call;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+
+            proxy_connect_timeout 5s;
+            proxy_send_timeout ${SESSION_CALL_TIMEOUT};
+            proxy_read_timeout ${SESSION_CALL_TIMEOUT};
+        }
+
         # Internal location: fetch the allowed-models list from the ORO Backend
         # so the proxy stays in sync without an image rebuild. njs subrequests
         # this on cache miss; shared-cache TTL lives in validate_model.js.
         location = /_backend_models {
             internal;
 
-            # Literal URL (no nginx vars) — nginx resolves the hostname once at
-            # startup via libc, which consults /etc/hosts. Lets environments
-            # that need to pin Backend to a specific IP override DNS without
-            # forking the proxy image. Location-match URI replacement still
-            # forwards `?provider=…` from the subrequest automatically.
+            # Per-request DNS, like /_openrouter_proxy/. A literal URL is
+            # resolved once at startup; when that CloudFront edge IP went
+            # stale, every allowlist fetch failed until the proxy restarted
+            # and each inference call returned 503. A variable proxy_pass
+            # sends its URI as-is, so the subrequest's `?provider=…` is
+            # appended explicitly.
+            resolver ${PROXY_RESOLVER} ipv6=off;
+            set $backend_models_upstream ${BACKEND_URL}/v1/public/inference/models;
             proxy_method GET;
-            proxy_pass ${BACKEND_URL}/v1/public/inference/models;
+            proxy_pass $backend_models_upstream$is_args$args;
             proxy_ssl_server_name on;
             proxy_http_version 1.1;
             # Strip parent-request headers + body and overwrite the framing
@@ -158,7 +171,7 @@ http {
             proxy_pass $chutes_upstream;
             proxy_ssl_server_name on;
 
-            # Forward miner's auth token (set by ProxyClient from CHUTES_ACCESS_TOKEN)
+            # Forward miner's auth token (set by ProxyClient from INFERENCE_ACCESS_TOKEN)
             proxy_set_header Authorization $http_authorization;
             proxy_set_header Host ${CHUTES_HOST};
             proxy_set_header X-Identifier "orosn15";
@@ -190,7 +203,7 @@ http {
             proxy_pass $openrouter_upstream;
             proxy_ssl_server_name on;
 
-            # Forward miner's auth token (set by ProxyClient from CHUTES_ACCESS_TOKEN /
+            # Forward miner's auth token (set by ProxyClient from
             # INFERENCE_ACCESS_TOKEN, populated per claim_work).
             proxy_set_header Authorization $http_authorization;
             proxy_set_header Host ${OPENROUTER_HOST};

@@ -10,31 +10,33 @@ Error Handling:
 """
 
 import logging
+import math
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from uuid import UUID
 
 import httpx
 import requests
 from bittensor_wallet import Wallet
-from oro_sdk import BittensorAuthClient, Client
-from oro_sdk.api.public import get_race_detail, get_race_history, get_top_agent
+from oro_sdk import BittensorAuthClient, Client, is_transient_status
+from oro_sdk.api.public import get_top_agent
 from oro_sdk.api.validator import (
     claim_work,
     complete_run,
     get_run_problems,
+    get_weight_salt,
     heartbeat,
     presign_upload,
     update_progress,
 )
+from oro_sdk.models.epoch_standings import EpochStandings
 from oro_sdk.models.claim_work_response import ClaimWorkResponse
 from oro_sdk.models.complete_run_request import CompleteRunRequest
 from oro_sdk.models.complete_run_response import CompleteRunResponse
 from oro_sdk.models.at_capacity_error import AtCapacityError
 from oro_sdk.models.eval_run_not_found_error import EvalRunNotFoundError
-from oro_sdk.models.invalid_problem_id_error import InvalidProblemIdError
 from oro_sdk.models.lease_expired_error import LeaseExpiredError
-from oro_sdk.models.missing_score_error import MissingScoreError
 from oro_sdk.models.not_run_owner_error import NotRunOwnerError
 from oro_sdk.models.run_already_complete_error import RunAlreadyCompleteError
 from oro_sdk.models.heartbeat_request import HeartbeatRequest as SdkHeartbeatRequest
@@ -43,8 +45,6 @@ from oro_sdk.models.presign_upload_request import PresignUploadRequest
 from oro_sdk.models.presign_upload_response import PresignUploadResponse
 from oro_sdk.models.problem_progress_update import ProblemProgressUpdate
 from oro_sdk.models.progress_update_request import ProgressUpdateRequest
-from oro_sdk.models.race_detail_response import RaceDetailResponse
-from oro_sdk.models.race_history_response import RaceHistoryResponse
 from oro_sdk.models.terminal_status import TerminalStatus
 from oro_sdk.models.top_agent_response import TopAgentResponse
 from oro_sdk.types import UNSET, Unset, Response
@@ -98,8 +98,8 @@ class BackendError(Exception):
     @property
     def is_transient(self) -> bool:
         """Return True if this error is transient and may be retried."""
-        if self.status_code is not None and self.status_code >= 500:
-            return True
+        if self.status_code is not None:
+            return is_transient_status(self.status_code)
         # Connection/timeout errors don't have status codes but are transient
         if self.status_code is None and self.sdk_error is None:
             return True
@@ -163,16 +163,33 @@ class BackendError(Exception):
     def is_eval_run_not_found(self) -> bool:
         return self.is_error(EvalRunNotFoundError)
 
-    @property
-    def is_invalid_problem_id(self) -> bool:
-        return self.is_error(InvalidProblemIdError)
-
-    @property
-    def is_missing_score(self) -> bool:
-        return self.is_error(MissingScoreError)
-
     def __str__(self) -> str:
         return self.message
+
+
+# Long-lived Session used by ``upload_to_s3`` so the validator's per-eval
+# upload burst reuses TCP+TLS connections instead of opening a fresh socket
+# per problem. Default urllib3 pool size (10) is enough to keep the
+# parallel uploader in _upload_logs cache-warm.
+_S3_SESSION = requests.Session()
+
+# Upper bound on the total supplementary-assignment share accepted from the
+# Backend. Real assignments reserve a small slice; a larger total signals a bad
+# payload, so the whole overlay is rejected (fail safe to the base vector).
+_MAX_OVERLAY_SHARE = 0.5
+
+
+@dataclass(frozen=True)
+class WeightSalt:
+    """One epoch's weight guidance from the Backend, fetched in a single call.
+
+    ``eligible`` preserves the Backend's eligibility decision for diagnostics;
+    None means the response itself was unavailable or malformed.
+    """
+
+    overlay: dict[int, float]
+    epoch_standings: EpochStandings | None
+    eligible: bool | None = None
 
 
 class BackendClient:
@@ -368,7 +385,7 @@ class BackendClient:
 
         Raises:
             BackendError: If the request fails.
-                - is_transient=True for 5xx/timeout/connection errors
+                - is_transient=True for 429/5xx/timeout/connection errors
                 - is_conflict=True if at capacity (409)
                 - is_auth_error=True if authentication fails (401/403)
         """
@@ -544,48 +561,77 @@ class BackendClient:
         )
 
     def get_top_miner(self) -> TopAgentResponse:
-        """Get the current top miner for emissions.
-
-        Returns:
-            TopAgentResponse with top miner info.
-
-        Raises:
-            BackendError: If the request fails.
-        """
+        """Get the post-embargo public top and emission policy."""
         return self._call_api(
             get_top_agent.sync_detailed,
             "get_top_miner",
             client=self._public_client,
         )
 
-    def get_race_history(self, limit: int = 1) -> RaceHistoryResponse:
-        """Fetch the most recent races (ordered newest-first).
+    def fetch_weight_salt(self) -> WeightSalt:
+        """Fetch this epoch's overlay + epoch-pinned standings in ONE call.
 
-        Args:
-            limit: Number of races to return.
+        Participation-gated (signed client). One request so both fields come
+        from the same epoch. On ANY fetch/parse error → empty overlay + None
+        standings, i.e. a miss: the caller retains its last-good on-chain weights
+        during the grace period, then tries the post-embargo public top. A
+        malformed payload must never raise past here or it would break Yuma
+        consensus.
 
-        Raises:
-            BackendError: If the request fails.
+        The overlay is the trust boundary: every share must be finite and in
+        [0, 1] and the total <= MAX_OVERLAY_SHARE, else the *whole* overlay is
+        rejected (keeps every honest validator on the same miss handling). The
+        pinned standings feed ``build_metagraph_weight_vector``, which already
+        tolerates arbitrary finisher input; an unusable value degrades to None
+        (a miss).
         """
-        return self._call_api(
-            get_race_history.sync_detailed,
-            "get_race_history",
-            client=self._public_client,
-            limit=limit,
+        try:
+            resp = self._call_api(
+                get_weight_salt.sync_detailed,
+                "fetch_weight_salt",
+                client=self._auth_client,
+            )
+        except (BackendError, ValueError, TypeError, AttributeError) as e:
+            logging.warning(f"Weight salt unavailable (miss; retaining last-good weights): {e}")
+            return WeightSalt(overlay={}, epoch_standings=None)
+
+        overlay = self._parse_overlay(resp)
+        standings = getattr(resp, "epoch_standings", None)
+        if standings is UNSET:
+            standings = None
+        eligible = getattr(resp, "eligible", None)
+        if not isinstance(eligible, bool):
+            eligible = None
+        return WeightSalt(
+            overlay=overlay,
+            epoch_standings=standings,
+            eligible=eligible,
         )
 
-    def get_race_detail(self, race_id: UUID) -> RaceDetailResponse:
-        """Fetch a single race with its qualifiers.
+    @staticmethod
+    def _parse_overlay(resp: Any) -> dict[int, float]:
+        """Validate + parse the response's ``weight_overlay`` → uid→share, or {}."""
+        try:
+            overlay = getattr(resp, "weight_overlay", None)
+            if overlay is None or overlay is UNSET:
+                return {}
+            parsed = {
+                int(uid): float(share) for uid, share in overlay.to_dict().items()
+            }
+        except (ValueError, TypeError, AttributeError) as e:
+            logging.warning(f"Weight overlay unparseable, using base vector: {e}")
+            return {}
 
-        Raises:
-            BackendError: If the request fails.
-        """
-        return self._call_api(
-            get_race_detail.sync_detailed,
-            "get_race_detail",
-            race_id=race_id,
-            client=self._public_client,
-        )
+        if not all(
+            math.isfinite(s) and 0.0 <= s <= 1.0 for s in parsed.values()
+        ) or sum(parsed.values()) > _MAX_OVERLAY_SHARE:
+            logging.warning(
+                "Weight overlay had out-of-range shares (total=%s); using base "
+                "vector",
+                sum(parsed.values()),
+            )
+            return {}
+        return parsed
 
     def upload_to_s3(self, presign: PresignUploadResponse, data: bytes) -> None:
         """Upload data to S3 using presigned URL.
@@ -599,7 +645,7 @@ class BackendClient:
         """
         method = presign.method if presign.method is not UNSET else "PUT"
         headers = {"Content-Type": "application/gzip"}
-        response = requests.request(
+        response = _S3_SESSION.request(
             method,
             presign.upload_url,
             headers=headers,
